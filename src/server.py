@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import asyncio
+import json
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel
+
+from .agent import agent_loop, cancel_session, cleanup_cancel_event, create_llm, get_cancel_event
+from .config import config
+from .session import session_manager
+
+
+class ChatRequest(BaseModel):
+    message: str
+
+
+app = FastAPI(title="AI Chat Sandbox")
+
+# Serve static assets (js, css, images) under /static
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    with open("static/index.html", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest, session_id: str = Query(default="")):
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="消息不能为空")
+
+    session_id_val = session_id or None
+    session = session_manager.get_or_create(session_id_val)
+
+    # Create/reset cancel event for this session
+    cancel_event = get_cancel_event(session.session_id)
+    cancel_event.clear()
+
+    async def _stream():
+        try:
+            async for event in agent_loop(session, req.message, cancel_event=cancel_event):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            yield "data: {\"type\": \"done\"}\n\n"
+        except asyncio.CancelledError:
+            yield f"data: {json.dumps({'type': 'error', 'message': '请求已取消'}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+        finally:
+            cleanup_cancel_event(session.session_id)
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Session-Id": session.session_id,
+        },
+    )
+
+
+@app.post("/api/cancel")
+async def cancel(session_id: str = Query(default="")):
+    """Cancel an in-progress agent execution for the given session."""
+    if not session_id:
+        raise HTTPException(status_code=400, detail="缺少 session_id 参数")
+
+    cancelled = cancel_session(session_id)
+    if cancelled:
+        return {"status": "cancelled", "session_id": session_id}
+    else:
+        return {"status": "no_active_execution", "session_id": session_id}
+
+
+@app.get("/api/config")
+async def get_config():
+    llm = create_llm()
+    return {
+        "provider": config.llm_provider,
+        "model": llm.model,
+        "sandbox_enabled": config.sandbox_enabled,
+        "sandbox_url": config.sandbox_base_url if config.sandbox_enabled else None,
+    }
+
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
