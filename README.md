@@ -25,9 +25,13 @@ AI Chat Sandbox 是一个基于 Web 的智能体平台，通过 **LLM Agent Loop
 |------|---------|------|
 | 🌐 **浏览器自动化** | MCP Browser + REST + xdotool | 导航/截图/点击/填表/JS求值/内容提取，三层降级策略保证可靠性 |
 | 💻 **Shell 终端** | `POST /v1/shell/exec` | 执行任意命令，支持后台任务 |
-| 📁 **文件管理** | `POST /v1/file/*` | 读写/列目录/正则搜索/glob查找/replace编辑 |
+| 📁 **文件管理** | `POST /v1/file/*` | 读写/列目录/正则搜索/glob查找/replace编辑/上传下载 |
 | 🐍 **代码执行** | `POST /v1/code/execute` | Python 和 Node.js 即时运行，带 stdout/stderr |
-| 📊 **Jupyter** | `POST /v1/jupyter/execute` | 交互式 Python 执行（notebook 会话） |
+| 📊 **Jupyter** | `POST /v1/jupyter/execute` | 交互式 Python 执行（notebook 会话），内核状态保持 |
+| 🖥️ **VSCode 视图** | code-server iframe | 右侧面板切换，`code <path>` 命令打开文件 |
+| 📄 **文档转换** | MCP Markitdown | URL/HTML 转 Markdown 格式 |
+| 📤 **文件上传** | `POST /api/upload` | 前端上传文件到沙箱容器 |
+| 📥 **文件下载** | `POST /v1/file/download` | 沙箱文件下载到浏览器 |
 | 🔄 **多 LLM 支持** | Anthropic / DeepSeek / OpenAI | provider 切换，运行时配置 |
 | 🛑 **可中断** | asyncio.Event + API | 用户随时取消执行，避免死循环 |
 | 🎭 **Agent Timeline** | SSE 流式事件 | 思考过程可视化：规划 → 分析(含推理) → 执行 → 观察 → 回复 |
@@ -124,7 +128,7 @@ OPENAI_BASE_URL=https://api.deepseek.com
 │  ┌──────────────────────────────────────────────────┐  │
 │  │  AI Chat Sandbox Web UI                         │  │
 │  │  - 聊天面板 (Agent Timeline 可视化)              │  │
-│  │  - noVNC 浏览器预览 (iframe)                    │  │
+│  │  - 右侧双视图: noVNC 桌面 + VSCode (code-server) │  │
 │  │  - 截图库 / 操作记录 / 会话管理                  │  │
 │  └──────────────────────┬───────────────────────────┘  │
 └─────────────────────────┼───────────────────────────────┘
@@ -194,18 +198,29 @@ OPENAI_BASE_URL=https://api.deepseek.com
              └─────────────────────────────────────────────────────────┘
 ```
 
-**循环防护机制：**
-- **Soft limit (15 轮)** — 超过后检查进度，无进展则自动终止
-- **Hard limit (25 轮)** — 绝对上限，强制停止
-- **重复调用检测** — 同一调用模式在最近 4 轮中出现 ≥3 次 → 自动终止
-- **用户可取消** — 每轮均检查 `cancel_event`，前端随时中断
+### Agent 智能增强机制
 
-**上下文管理：**
+#### 沙箱强制调用
+
+Agent Loop 在首轮迭代时检测用户消息中的关键词（如 `jupyter`、`画图`、`截图`、`打开`、`浏览器`、`shell`、`终端`、`pip` 等），若 LLM 尝试用纯文本回复而非调用工具，系统会自动插入一条强制指令，要求 LLM 调用实际工具完成操作。这确保了涉及沙箱的操作总是真实执行，而非文字描述。
+
+#### VSCode 意图识别
+
+系统自动识别用户请求中与 VSCode / 代码编辑相关的关键词，触发右侧面板自动切换到 VSCode 视图，无需用户手动切换。
+
+#### 上下文压缩
+
 - **滑动窗口压缩** — 超过 45% 上下文窗口时裁剪早期轮次，保留最近 10 组 assistant+tool 消息对
 - **紧急压缩** — 超过 70% 时强制压缩并截断所有工具结果至 500 字符
 - **工具结果截断** — 按工具类型设置不同截断限制（shell_exec: 2000, file_read: 3000 等）
 - **Base64 隔离** — 截图 base64 数据不进入 LLM 消息，替换为 `[截图已获取]` 占位符
-- **每个 provider 独立估计** — Anthropic 80K / OpenAI 48K 保守估计值
+
+#### 循环防护
+
+- **Soft limit (15 轮)** — 超过后检查进度，无进展则自动终止
+- **Hard limit (25 轮)** — 绝对上限，强制停止
+- **重复调用检测** — 同一调用模式在最近 4 轮中出现 ≥3 次 → 自动终止
+- **用户可取消** — 每轮均检查 `cancel_event`，前端随时中断
 
 ### 浏览器控制三层降级
 
@@ -217,7 +232,7 @@ OPENAI_BASE_URL=https://api.deepseek.com
 
 ---
 
-## 🛠️ 工具清单
+## 🛠️ 工具清单（33 个）
 
 ### 浏览器工具（21 个）
 
@@ -240,7 +255,7 @@ OPENAI_BASE_URL=https://api.deepseek.com
 | `browser_tabs_list` / `create` / `activate` | 标签页管理 | MCP → xdotool |
 | `browser_wait` | 等待（超时/元素/加载） | REST sleep |
 
-### 沙箱工具（7 个）
+### 沙箱工具（14 个）
 
 | 工具 | 说明 |
 |------|------|
@@ -248,33 +263,48 @@ OPENAI_BASE_URL=https://api.deepseek.com
 | `shell_exec` | 执行 Shell 命令 |
 | `file_read` / `file_write` / `file_list` | 文件读写列目录 |
 | `file_search` / `file_find` | 正则搜索 / glob 查找 |
+| `file_replace` | 文本替换编辑 |
+| `file_download` | 从沙箱下载文件到本地 |
+| `file_upload` | 上传文件到沙箱 |
 | `code_python` / `code_javascript` | 运行 Python / Node.js 代码 |
+| `jupyter_execute` | Jupyter notebook 代码执行（有状态） |
+| `markitdown_convert` | URL/HTML 转 Markdown |
 
 ---
 
 ## 💬 使用示例
 
-### 浏览器操作
+### 浏览器沙箱
 
 ```
 你 → 打开 https://news.ycombinator.com 并截图
-AI → [导航 → 等待加载 → 截图 → 展示图片]
+AI → [browser_navigate → 等待加载 → browser_screenshot → 展示图片]
 
-你 → 页面上有哪些可点击的东西？
-AI → [调用 browser_get_clickable_elements → 返回链接列表]
+你 → 打开 baidu.com，搜索"人工智能"
+AI → [browser_navigate → browser_fill 搜索框 → browser_click 搜索按钮 → screenshot]
 
-你 → 点击第 3 个链接，然后告诉我页面内容
-AI → [点击 → browser_get_text → 总结内容]
+你 → 打开 https://www.w3.org 查看页面主要内容
+AI → [browser_navigate → browser_get_markdown → 输出内容]
 ```
 
-### 代码执行
+### VSCode 开发
 
 ```
-你 → 用 Python 写一个快速排序并测试
-AI → [code_python → 编译运行 → 输出结果]
+你 → 在VSCode里创建一个Python文件输出Hello World并运行
+AI → [file_write 创建文件 → shell_exec "code <路径>" 在VSCode中打开 → code_python 运行]
 
-你 → 用 Node.js 计算斐波那契数列前 30 项性能
-AI → [code_javascript → 运行 → 输出耗时]
+你 → 创建一个HTML文件并预览
+AI → [file_write 创建HTML → shell_exec "code <路径>" 打开 → browser_navigate 预览]
+```
+
+### 数据处理
+
+```
+你 → 用Jupyter画一个正弦波和余弦波的对比图
+AI → [jupyter_execute 运行numpy/matplotlib代码 → 展示生成的图表]
+
+你 → 分析当前目录下的Python代码行数
+AI → [shell_exec find/wc统计 → 输出汇总结果]
 ```
 
 ### 文件操作
@@ -325,9 +355,11 @@ ai-chat-sandbox/
 │       └── sandbox.py       # 28 个沙箱工具 + SandboxAPI 客户端
 │
 ├── static/
-│   ├── index.html           # 聊天界面（CSS 样式完整嵌入）
-│   └── js/
-│       └── app.js           # 前端逻辑（SSE 消费 / Timeline / 面板拖拽）
+│   ├── index.html           # 聊天界面（CSS 样式完整嵌入，含 VSCode iframe）
+│   ├── js/
+│   │   └── app.js           # 前端逻辑（SSE 消费 / Timeline / 面板拖拽 / 视图切换）
+│   ├── screenshots/         # 运行时截图保存目录（已 gitignore）
+│   └── downloads/           # 文件下载保存目录（已 gitignore）
 │
 └── docs/                    # 设计文档和计划
     ├── specs/
@@ -352,18 +384,19 @@ ai-chat-sandbox/
 | `POST` | `/v1/file/list` | 列目录 | ✅ |
 | `POST` | `/v1/file/search` | 正则搜索 | ✅ |
 | `POST` | `/v1/file/find` | glob 查找 | ✅ |
-| `POST` | `/v1/file/replace` | 文本替换 | — |
+| `POST` | `/v1/file/replace` | 文本替换 | ✅ |
 | `POST` | `/v1/file/str_replace_editor` | 结构化编辑 | — |
-| `GET` | `/v1/file/download` | 文件下载 | — |
-| `POST` | `/v1/file/upload` | 文件上传 | — |
+| `GET` | `/v1/file/download` | 文件下载 | ✅ |
+| `POST` | `/v1/file/upload` | 文件上传 | ✅ |
 | `GET` | `/v1/browser/info` | 浏览器信息 | ✅ |
 | `GET` | `/v1/browser/screenshot` | 截图（PNG 流） | ✅ |
 | `POST` | `/v1/browser/actions` | 鼠标/键盘/滚动 | ✅ |
 | `POST` | `/v1/browser/config` | 分辨率设置 | — |
 | `POST` | `/v1/code/execute` | Python/JS 代码执行 | ✅ |
-| `POST` | `/v1/jupyter/execute` | Jupyter 代码执行 | — |
+| `POST` | `/v1/jupyter/execute` | Jupyter 代码执行 | ✅ |
 | `POST` | `/v1/nodejs/execute` | Node.js 代码执行 | ✅ |
 | `POST` | `/v1/util/convert_to_markdown` | HTML→Markdown | ✅ |
+| `POST` | `/v1/mcp/{name}/tools/{tool}` | MCP 工具调用 | ✅ (browser, markitdown) |
 
 ### MCP 服务端点
 
@@ -373,7 +406,7 @@ ai-chat-sandbox/
 | `GET` | `/v1/mcp/{name}/tools` | 列出工具 |
 | `POST` | `/v1/mcp/{name}/tools/{tool}` | 调用工具 |
 
-**预置 MCP 服务：** `browser`（21 个工具）、`chrome_devtools`
+**预置 MCP 服务：** `browser`（21 个工具）、`markitdown`（文档转换）、`chrome_devtools`
 
 ---
 

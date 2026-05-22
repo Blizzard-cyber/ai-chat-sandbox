@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import urllib.parse
 from typing import Any, TYPE_CHECKING
 
 import httpx
@@ -94,12 +95,41 @@ class SandboxAPI:
         resp = await self._post("/v1/file/find", {"path": path, "glob": glob})
         return resp.get("data", resp)
 
+    async def file_replace(self, path: str, old_text: str, new_text: str) -> dict[str, Any]:
+        """Replace the first occurrence of old_text with new_text in file."""
+        resp = await self._post("/v1/file/replace", {
+            "file": path, "old_text": old_text, "new_text": new_text,
+        })
+        return resp.get("data", resp)
+
+    async def file_download(self, path: str) -> bytes:
+        """Download a file from the sandbox. Returns raw bytes."""
+        encoded = urllib.parse.quote(path)
+        return await self._get_bytes(f"/v1/file/download?file={encoded}")
+
+    async def file_upload(self, path: str, content_b64: str) -> dict[str, Any]:
+        """Upload a file to the sandbox. content_b64 is base64-encoded content."""
+        resp = await self._post("/v1/file/upload", {
+            "file": path, "content": content_b64, "encoding": "base64",
+        })
+        return resp.get("data", resp)
+
     # ------------------------------------------------------------------
     # code execution
     # ------------------------------------------------------------------
 
     async def code_execute(self, language: str, code: str, timeout: int = 30) -> dict[str, Any]:
         resp = await self._post("/v1/code/execute", {"language": language, "code": code, "timeout": timeout})
+        return resp.get("data", resp)
+
+    # ------------------------------------------------------------------
+    # jupyter
+    # ------------------------------------------------------------------
+
+    async def jupyter_execute(self, code: str, timeout: int = 60) -> dict[str, Any]:
+        """Execute Python code in a persistent Jupyter kernel. Kernel state
+        (variables, imports) persists across calls within the same session."""
+        resp = await self._post("/v1/jupyter/execute", {"code": code, "timeout": timeout})
         return resp.get("data", resp)
 
     # ------------------------------------------------------------------
@@ -119,37 +149,47 @@ class SandboxAPI:
         return await self._post("/v1/browser/actions", action)
 
     # ------------------------------------------------------------------
-    # MCP browser tools  (primary browser API)
+    # MCP tool calls  (generic + browser + markitdown)
     # ------------------------------------------------------------------
 
-    async def mcp_browser_call(self, tool_name: str, arguments: dict[str, Any] | None = None) -> str:
-        """Call an MCP browser tool and return its text content.
-
+    async def mcp_call(self, server: str, tool_name: str, arguments: dict[str, Any] | None = None) -> str:
+        """Call any MCP server tool and return its text content.
         Returns the text string on success, or a string starting with [ERROR]
         on failure.
         """
         try:
             resp = await self._post(
-                f"/v1/mcp/browser/tools/{tool_name}",
+                f"/v1/mcp/{server}/tools/{tool_name}",
                 arguments or {},
             )
         except Exception as exc:
-            return f"[ERROR] MCP call '{tool_name}' failed: {exc}"
+            return f"[ERROR] MCP call '{server}/{tool_name}' failed: {exc}"
 
         if not resp.get("success"):
             msg = resp.get("message", "unknown error")
-            return f"[ERROR] MCP '{tool_name}' returned failure: {msg}"
+            return f"[ERROR] MCP '{server}/{tool_name}' returned failure: {msg}"
 
         data = resp.get("data", {})
         if data.get("isError"):
             content = data.get("content", [])
             err_text = content[0].get("text", "unknown") if content else "unknown"
-            return f"[ERROR] MCP '{tool_name}' error: {err_text}"
+            return f"[ERROR] MCP '{server}/{tool_name}' error: {err_text}"
 
         content = data.get("content", [])
         if content:
-            return content[0].get("text", "")
+            item = content[0]
+            if isinstance(item, dict):
+                return item.get("text", "")
+            return str(item)
         return ""
+
+    async def mcp_browser_call(self, tool_name: str, arguments: dict[str, Any] | None = None) -> str:
+        """Call the browser MCP server tool."""
+        return await self.mcp_call("browser", tool_name, arguments)
+
+    async def mcp_markitdown_call(self, tool_name: str, arguments: dict[str, Any] | None = None) -> str:
+        """Call the markitdown MCP server tool (document conversion)."""
+        return await self.mcp_call("markitdown", tool_name, arguments)
 
     # ------------------------------------------------------------------
     # xdotool helpers  (fallback when MCP is unresponsive)
@@ -891,6 +931,118 @@ class CodeJavaScriptTool(Tool):
         return stdout or json.dumps(result, ensure_ascii=False)
 
 
+class FileReplaceTool(Tool):
+    def __init__(self, api: SandboxAPI):
+        self._api = api
+        super().__init__(
+            name="file_replace",
+            description="在文件中精确替换文本。将文件中首次出现的 old_text 替换为 new_text。比 read + write 更安全，用于修改配置文件、代码等场景。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件绝对路径"},
+                    "old_text": {"type": "string", "description": "要替换的旧文本（首次出现被替换）"},
+                    "new_text": {"type": "string", "description": "替换后的新文本"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        )
+
+    async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
+        result = await self._api.file_replace(path, old_text, new_text)
+        # Surface API-level errors (e.g. file not found)
+        if isinstance(result, dict) and ("error" in result or not result.get("success", True)):
+            return json.dumps(result, ensure_ascii=False)
+        replaced = result.get("replaced", False)
+        count = result.get("count", 0)
+        if replaced:
+            return f"已替换 {count} 处匹配"
+        return "未找到匹配文本，未做任何替换"
+
+
+class FileDownloadTool(Tool):
+    def __init__(self, api: SandboxAPI):
+        self._api = api
+        super().__init__(
+            name="file_download",
+            description="从沙箱下载文件。返回文件内容供 LLM 读取或保存到本地。适合查看沙箱中的文件、将处理结果提供给用户等场景。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件在沙箱中的绝对路径"},
+                },
+                "required": ["path"],
+            },
+        )
+
+    async def execute(self, path: str, **kwargs: Any) -> str:
+        try:
+            raw = await self._api.file_download(path)
+            b64 = base64.b64encode(raw).decode("utf-8")
+            filename = path.rsplit("/", 1)[-1] or "download"
+            return f"[FILE_DOWNLOAD]{b64}|{filename}"
+        except Exception as exc:
+            return f"[ERROR] 下载失败：{exc}"
+
+
+class FileUploadTool(Tool):
+    def __init__(self, api: SandboxAPI):
+        self._api = api
+        super().__init__(
+            name="file_upload",
+            description="将 base64 编码的内容上传到沙箱中的指定路径。用于向沙箱写入文件（图片、数据文件等）。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件在沙箱中的目标绝对路径"},
+                    "content_b64": {"type": "string", "description": "文件的 base64 编码内容"},
+                },
+                "required": ["path", "content_b64"],
+            },
+        )
+
+    async def execute(self, path: str, content_b64: str, **kwargs: Any) -> str:
+        try:
+            result = await self._api.file_upload(path, content_b64)
+            if isinstance(result, dict) and not result.get("success", True):
+                return f"[ERROR] 上传失败：{result.get('message', '未知错误')}"
+            return f"✅ 文件已上传到 {path}"
+        except Exception as exc:
+            return f"[ERROR] 上传失败：{exc}"
+
+
+class MarkitdownConvertTool(Tool):
+    def __init__(self, api: SandboxAPI):
+        self._api = api
+        super().__init__(
+            name="markitdown_convert",
+            description="将 URL 指向的网页或原始 HTML 内容转换为 Markdown 格式。适合提取网页内容、文档归档等场景。如果已打开浏览器页面，使用 browser_get_markdown 更直接。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "要转换的网页 URL（与 html 二选一）"},
+                    "html": {"type": "string", "description": "原始 HTML 内容（与 url 二选一）"},
+                },
+                "required": [],
+            },
+        )
+
+    async def execute(self, url: str | None = None, html: str | None = None, **kwargs: Any) -> str:
+        args: dict[str, Any] = {}
+        if url:
+            args["url"] = url
+        elif html:
+            args["html"] = html
+        else:
+            return "[ERROR] 必须提供 url 或 html 参数"
+        result = await self._api.mcp_markitdown_call("convert", args)
+        if result.startswith("[ERROR]"):
+            return result
+        if len(result) > 20000:
+            result = result[:20000] + f"\n\n[...结果已截断，共 {len(result)} 字符]"
+        return result or "[INFO] 转换完成但无内容返回"
+
+
 # ------------------------------------------------------------------
 # helpers
 # ------------------------------------------------------------------
@@ -902,6 +1054,44 @@ async def _sleep_in_sandbox(api: SandboxAPI, seconds: float) -> None:
         await api.shell_exec(f"sleep {seconds}", timeout=int(seconds) + 5)
     except Exception:
         pass
+
+
+class JupyterExecuteTool(Tool):
+    def __init__(self, api: SandboxAPI):
+        self._api = api
+        super().__init__(
+            name="jupyter_execute",
+            description="在沙箱的 Jupyter 内核中执行 Python 代码。Jupyter 维护内核状态——变量、导入、函数定义在多次调用间保持，适合数据分析、可视化、逐步实验等需要连续上下文的场景。如果是一次性脚本用 code_python 即可。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "要执行的 Python 代码"},
+                    "timeout": {"type": "integer", "description": "超时秒数，默认 60"},
+                },
+                "required": ["code"],
+            },
+        )
+
+    async def execute(self, code: str, timeout: int = 60, **kwargs: Any) -> str:
+        try:
+            result = await self._api.jupyter_execute(code, timeout)
+        except Exception as exc:
+            return f"[ERROR] Jupyter 执行失败：{exc}"
+        outputs = result.get("outputs", [])
+        text_parts = []
+        for out in outputs:
+            otype = out.get("type", "")
+            if otype == "stream":
+                text_parts.append(out.get("text", "") or "")
+            elif otype == "text" or otype == "display_data":
+                text = out.get("text", "") or ""
+                text_parts.append(text)
+            elif otype == "error":
+                ename = out.get("ename", "Error")
+                evalue = out.get("evalue", "")
+                traceback = "\n".join(out.get("traceback", []))
+                text_parts.append(f"[{ename}] {evalue}\n{traceback}")
+        return "\n".join(text_parts) or json.dumps(result, ensure_ascii=False)
 
 
 # ------------------------------------------------------------------
@@ -939,8 +1129,13 @@ def register_sandbox_tools(registry: "ToolRegistry", sandbox_base_url: str) -> "
         FileListTool(api),
         FileSearchTool(api),
         FileFindTool(api),
+        FileReplaceTool(api),
+        FileDownloadTool(api),
+        FileUploadTool(api),
+        MarkitdownConvertTool(api),
         CodePythonTool(api),
         CodeJavaScriptTool(api),
+        JupyterExecuteTool(api),
     ]
     registry.register_many(tools)
     return registry

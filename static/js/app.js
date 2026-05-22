@@ -19,12 +19,14 @@ const sidebar = document.getElementById('sidebar');
 const sidebarOverlay = document.getElementById('sidebarOverlay');
 const sidebarResizeHandle = document.getElementById('sidebarResizeHandle');
 const rpVnc = document.getElementById('rpVnc');
+const rpVscode = document.getElementById('rpVscode');
 const rpUrl = document.getElementById('rpUrl');
 const ssGrid = document.getElementById('ssGrid');
 const actionList = document.getElementById('actionList');
 const actEmptyEl = document.getElementById('actEmpty');
 const ssEmptyEl = document.getElementById('ssEmpty');
 const vncContainer = document.getElementById('vncContainer');
+const vscodeContainer = document.getElementById('vscodeContainer');
 const vncFrame = document.getElementById('vncFrame');
 const vncResizeHandle = document.getElementById('vncResizeHandle');
 const rpDrawer = document.getElementById('rpDrawer');
@@ -41,6 +43,7 @@ let vncBaseSize = { w: 1280, h: 720 };
 let panelDragState = null;
 let panelWidthManual = false;
 let vncFitRaf = null;
+let sandboxBaseUrl = '';
 
 if (sessionId) {
   const u = new URL(location); u.searchParams.set('session_id', sessionId);
@@ -137,6 +140,7 @@ function setPanelMax(isMax) {
 
     if (c.sandbox_enabled && c.sandbox_url) {
       const base = c.sandbox_url.replace(/\/$/, '');
+      sandboxBaseUrl = base;
       const vncUrl = base + '/vnc/index.html?autoconnect=true';
       if (rpVnc) {
                 setVncStatus('正在连接沙箱桌面...', true);
@@ -207,6 +211,19 @@ function refreshVnc() {
   rpVnc.src = rpVnc.src;
   scheduleFitVncFrame();
 }
+function switchSandboxView(view) {
+  document.querySelectorAll('.rp-view-btn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+  if (vncContainer) vncContainer.style.display = view === 'vnc' ? 'flex' : 'none';
+  if (vscodeContainer) vscodeContainer.style.display = view === 'vscode' ? 'flex' : 'none';
+  if (rpUrl) rpUrl.style.display = view === 'vnc' ? 'block' : 'none';
+  if (view === 'vscode') {
+    if (rpVscode && !rpVscode.src && sandboxBaseUrl) {
+      rpVscode.src = sandboxBaseUrl + '/code-server/';
+    }
+    scheduleFitVncFrame();
+  }
+}
+
 function syncPanelWidth(widthPx) {
   const w = Math.max(360, Math.min(window.innerWidth - 380, widthPx));
   panelWidthManual = true;
@@ -397,6 +414,10 @@ function addResultToCard(type, data) {
     card.innerHTML = `
       <div class="rc-header"><span class="rc-left">📋 执行输出</span><span class="rc-right"></span></div>
       <div class="rc-body"><div class="rc-log">${esc(data)}</div></div>`;
+  } else if (type === 'download') {
+    card.innerHTML = `
+      <div class="rc-header"><span class="rc-left">📥 文件下载</span><span class="rc-right"></span></div>
+      <div class="rc-body"><a href="${esc(data.src)}" target="_blank" class="dl-link" download="${esc(data.name)}">⬇️ ${esc(data.name)}</a></div>`;
   }
   results.appendChild(card);
   scrollBottom();
@@ -589,6 +610,29 @@ async function clearChat() {
 
 function sendHint(t) { input.value = t; send(); }
 
+// === Upload ===
+document.getElementById('fileInput').addEventListener('change', async function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  if (!sessionId) {
+    addNoticeBubble('请先发送一条消息建立会话后再上传文件');
+    return;
+  }
+  const formData = new FormData();
+  formData.append('session_id', sessionId);
+  formData.append('file', file);
+  try {
+    addNoticeBubble(`正在上传 ${file.name}...`);
+    const resp = await fetch('/api/upload', { method: 'POST', body: formData });
+    if (!resp.ok) throw new Error(await resp.text());
+    const result = await resp.json();
+    addNoticeBubble(`✅ 文件 ${result.filename} 已上传到沙箱（${(result.size / 1024).toFixed(1)}KB）`);
+  } catch (err) {
+    addNoticeBubble(`❌ 上传失败: ${err.message}`);
+  }
+  this.value = '';
+});
+
 // === Send ===
 input.addEventListener('input', () => {
   input.style.height = 'auto';
@@ -712,7 +756,16 @@ async function send() {
               }
               break;
 
+            case 'file':
+              addResultToCard('download', { src: ev.src, name: ev.name || 'download' });
+              break;
+
             case 'browser_action':
+              if (ev.action === 'open_vscode') {
+                openRightPanel();
+                switchSandboxView('vscode');
+                break;
+              }
               openRightPanel();
               logBrowserAction(ev.action, ev.detail || ev.url || ev.selector || ev.text || ev.direction || '');
               break;

@@ -20,3 +20,7 @@ build/
 *.swp
 *.swo
 *~
+
+# Static non-code assets (generated at runtime)
+static/screenshots/
+static/downloads/

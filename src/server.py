@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shutil
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
@@ -13,6 +14,7 @@ from pydantic import BaseModel
 from .agent import agent_loop, cancel_session, cleanup_cancel_event, create_llm, get_cancel_event
 from .config import config
 from .session import session_manager
+from .tools.sandbox import SandboxAPI
 
 
 class ChatRequest(BaseModel):
@@ -123,6 +125,40 @@ async def get_config():
         "sandbox_enabled": config.sandbox_enabled,
         "sandbox_url": config.sandbox_base_url if config.sandbox_enabled else None,
     }
+
+
+@app.post("/api/upload")
+async def upload_file(
+    session_id: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """Upload a file from the user's machine to the sandbox."""
+    if not config.sandbox_enabled:
+        raise HTTPException(status_code=400, detail="沙箱未启用")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="未选择文件")
+
+    api = SandboxAPI(config.sandbox_base_url)
+
+    content = await file.read()
+    content_b64 = base64.b64encode(content).decode("utf-8")
+
+    target_dir = "/home/gem/uploads"
+    safe_filename = os.path.basename(file.filename)
+    if not safe_filename:
+        await api.close()
+        raise HTTPException(status_code=400, detail="无效文件名")
+    target_path = f"{target_dir}/{safe_filename}"
+    try:
+        await api.shell_exec(f"mkdir -p {target_dir}", timeout=5)
+        await api.file_upload(target_path, content_b64)
+        return {"status": "ok", "path": target_path, "filename": safe_filename, "size": len(content)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"上传失败：{e}")
+    finally:
+        await api.close()
 
 
 @app.get("/api/health")

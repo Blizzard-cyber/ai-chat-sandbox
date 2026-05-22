@@ -529,6 +529,19 @@ body {
   padding: 8px;
   background: #fafafa;
 }
+.rc-card .rc-body .dl-link {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 16px; background: var(--accent-light); color: var(--accent);
+  border-radius: 8px; text-decoration: none; font-weight: 500; font-size: 13px;
+  transition: background 0.15s;
+}
+.rc-card .rc-body .dl-link:hover { background: #ffe0cc; }
+.upload-btn {
+  background: none; border: none; color: var(--text-muted); cursor: pointer;
+  font-size: 18px; padding: 4px 6px; border-radius: 4px; transition: color 0.15s;
+  flex-shrink: 0; line-height: 1;
+}
+.upload-btn:hover { color: var(--accent); }
 .rc-card .rc-body img {
   width: 100%;
   border-radius: 4px;
@@ -813,6 +826,17 @@ body {
   font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   flex-shrink: 0;
 }
+.rp-header-left { display: flex; align-items: center; gap: 8px; }
+.rp-view-tabs { display: flex; gap: 2px; background: #f3f4f6; border-radius: 8px; padding: 2px; }
+.rp-view-btn {
+  padding: 5px 12px; border: none; border-radius: 6px; background: transparent;
+  color: var(--text-secondary); font-size: 11px; cursor: pointer; transition: all 0.15s;
+  white-space: nowrap;
+}
+.rp-view-btn:hover { color: var(--text-primary); }
+.rp-view-btn.active { background: #fff; color: var(--text-primary); box-shadow: var(--shadow-sm); }
+.rp-vscode { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.rp-vscode-frame { width: 100%; flex: 1; border: none; }
 .rp-vnc {
   flex: 1; display: flex; align-items: center; justify-content: center;
   background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
@@ -905,6 +929,10 @@ body {
   box-shadow: var(--shadow-sm);
 }
 .empty-state .hint:hover { border-color: var(--accent); background: var(--accent-light); }
+.empty-state .hint-group-label {
+  width: 100%; text-align: center; font-size: 12px; font-weight: 600;
+  color: var(--text-secondary); padding: 4px 0 0 0; margin-top: 4px;
+}
 .cap-row { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; margin-top: 4px; }
 .cap-tag { font-size: 11px; color: var(--text-muted); padding: 2px 10px; background: #f3f4f6; border-radius: 10px; }
 
@@ -1001,18 +1029,23 @@ body {
         <div class="subtitle">我会自动判断是否需要使用沙箱工具来完成任务，并将完整流程可视化展示</div>
         <div class="cap-row">
           <span class="cap-tag">🌐 浏览器</span>
+          <span class="cap-tag">🔧 VSCode</span>
           <span class="cap-tag">💻 Shell</span>
           <span class="cap-tag">📁 文件</span>
-          <span class="cap-tag">🐍 Python</span>
-          <span class="cap-tag">🟨 Node.js</span>
+          <span class="cap-tag">🐍 Python/Jupyter</span>
+          <span class="cap-tag">📝 Markdown</span>
         </div>
         <div class="hints">
+          <!-- <div class="hint-group-label">🌐 浏览沙箱</div> -->
           <div class="hint" onclick="sendHint(this.textContent)">🌐 打开163.com并截图</div>
-          <div class="hint" onclick="sendHint(this.textContent)">💻 查看系统信息（CPU/内存/磁盘）</div>
-          <div class="hint" onclick="sendHint(this.textContent)">🐍 用Python绘制一个正弦波图</div>
-          <div class="hint" onclick="sendHint(this.textContent)">📁 在 /home 下创建一个笔记文件并写入内容</div>
-          <div class="hint" onclick="sendHint(this.textContent)">🟨 用Node.js计算斐波那契数列前30项</div>
-          <div class="hint" onclick="sendHint(this.textContent)">📋 获取沙箱环境信息</div>
+          <div class="hint" onclick="sendHint(this.textContent)">🌐 打开news.163.com告诉我今天的头条新闻</div>
+          <div class="hint" onclick="sendHint(this.textContent)">🌐 打开baidu.com搜索"天气预报"并截图</div>
+          <!-- <div class="hint-group-label">🔧 VSCode 开发</div>
+          <div class="hint" onclick="sendHint(this.textContent)">🔧 在VSCode里创建一个Python文件输出"Hello World"并运行</div>
+          <div class="hint" onclick="sendHint(this.textContent)">🔧 在VSCode里写一个HTML页面展示实时时钟</div>
+          <div class="hint-group-label">📊 数据处理</div>
+          <div class="hint" onclick="sendHint(this.textContent)">📊 用Jupyter实际执行代码：画一个正弦波和余弦波的对比图</div>
+          <div class="hint" onclick="sendHint(this.textContent)">📝 把 https://zh.wikipedia.org/wiki/Python 转为Markdown</div> -->
         </div>
       </div>
     </div>
@@ -1021,6 +1054,8 @@ body {
   <div class="input-area">
     <div class="input-inner">
       <textarea id="input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行..." autofocus></textarea>
+      <button class="upload-btn" id="uploadBtn" onclick="document.getElementById('fileInput').click()" title="上传文件">📎</button>
+      <input type="file" id="fileInput" style="display:none">
       <button class="send-btn" id="sendBtn" onclick="send()" title="发送"><span class="send-icon">&#10148;</span></button>
       <button class="stop-btn" id="stopBtn" onclick="stopExecution()" title="停止"><span class="stop-icon">■</span></button>
     </div>
@@ -1033,7 +1068,12 @@ body {
 <!-- ====== RIGHT PANEL (slides in) ====== -->
 <div class="right-panel" id="rightPanel">
   <div class="rp-header">
-    <span class="rp-title"><span class="live-dot"></span> 沙箱</span>
+    <div class="rp-header-left">
+      <div class="rp-view-tabs">
+        <button class="rp-view-btn active" data-view="vnc" onclick="switchSandboxView('vnc')">🖥️ 桌面</button>
+        <button class="rp-view-btn" data-view="vscode" onclick="switchSandboxView('vscode')">🔧 VSCode</button>
+      </div>
+    </div>
     <span class="rp-size" id="panelSizeHint">60%</span>
     <div class="rp-actions">
       <button class="rp-btn" onclick="togglePanelMax()" title="最大化">⤢</button>
@@ -1055,6 +1095,9 @@ body {
     <div class="rp-vnc-frame" id="vncFrame">
       <iframe id="rpVnc" allow="fullscreen; clipboard-read; clipboard-write" allowfullscreen webkitallowfullscreen mozallowfullscreen></iframe>
     </div>
+  </div>
+  <div class="rp-vscode" id="vscodeContainer" style="display:none;">
+    <iframe id="rpVscode" class="rp-vscode-frame" allow="fullscreen; clipboard-read; clipboard-write"></iframe>
   </div>
   <div class="rp-drawer collapsed" id="rpDrawer">
     <div class="rp-tabs">
