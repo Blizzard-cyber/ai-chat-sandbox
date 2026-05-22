@@ -226,6 +226,7 @@ body {
 .t-step-icon.e { background: rgba(245,158,11,0.12); color: var(--phase-exec); }
 .t-step-icon.o { background: rgba(139,92,246,0.12); color: var(--phase-observe); }
 .t-step-icon.r { background: rgba(34,197,94,0.12); color: var(--phase-respond); }
+.t-step-icon.p { background: rgba(139,92,246,0.12); color: var(--phase-observe); }
 .t-step-line {
   width: 1.5px; flex: 1; min-height: 6px; margin: 3px 0;
   background: linear-gradient(to bottom, #e5e7eb, transparent);
@@ -348,6 +349,29 @@ body {
   color: var(--error); font-size: 13px; padding: 8px 14px;
   background: var(--error-bg); border: 1px solid rgba(239,68,68,0.2);
   border-radius: var(--radius-sm); margin: 4px 0;
+}
+
+.reasoning-block {
+  font-size: 13px; background: #f8f6f3; border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm); margin: 0 0 8px; overflow: hidden;
+}
+.reasoning-block summary {
+  padding: 6px 10px; cursor: pointer; font-size: 12px; font-weight: 500;
+  color: var(--text-secondary); user-select: none;
+  background: rgba(0,0,0,0.02);
+}
+.reasoning-block summary:hover { background: rgba(0,0,0,0.04); }
+.reasoning-content {
+  white-space: pre-wrap; font-family: var(--font-mono); font-size: 12px;
+  color: var(--text-secondary); padding: 8px 12px; max-height: 240px;
+  overflow-y: auto; line-height: 1.6; border-top: 1px solid var(--border-light);
+}
+
+.notice-bubble {
+  text-align: center; font-size: 12px; color: var(--text-muted);
+  background: rgba(99,102,241,0.06); border: 1px solid rgba(99,102,241,0.1);
+  border-radius: var(--radius-sm); padding: 6px 14px; margin: 6px 0;
+  animation: msg-in 0.3s ease-out;
 }
 
 .typing-dots { display: flex; gap: 4px; padding: 6px 0; }
@@ -643,7 +667,7 @@ body {
     </div>
   </div>
   <div class="sb-footer">
-    <span>会话 TTL 30 分钟 · 最大 10 轮迭代</span>
+    <span>会话 TTL 30 分钟 · 迭代上限 25 轮</span>
   </div>
 </aside>
 

@@ -16,31 +16,82 @@ from .tools.sandbox import register_sandbox_tools
 
 logger = logging.getLogger(__name__)
 
-MAX_ITERATIONS = 10
+# ------------------------------------------------------------------
+# Agent configuration
+# ------------------------------------------------------------------
 
-SYSTEM_PROMPT = """你是一个有用的 AI 助手。你可以进行普通对话，也可以在需要时使用工具来完成用户的任务。
+SOFT_LIMIT = 15         # Normal max iterations — extend for complex tasks
+HARD_LIMIT = 25         # Absolute max iterations — hard stop
+MAX_CONTEXT_PAIRS = 10  # Max assistant+tool pairs preserved during compression
+TRIM_THRESHOLD = 0.45   # Trigger context trim at 45% of estimated context window
+EMERGENCY_THRESHOLD = 0.70  # Force compression regardless of content
+
+# Conservative context-window estimates per provider.
+# These should be well under the model's true limit so compression
+# fires early enough to keep the LLM call efficient.
+ESTIMATED_CONTEXT_WINDOW = {
+    "anthropic": 80_000,
+    "openai": 48_000,
+}
+
+# Per-tool truncation limits (characters). Tool names not in this map
+# default to 300 characters.
+TOOL_TRUNCATION_LIMITS = {
+    "shell_exec": 2000,
+    "file_read": 3000,
+    "browser_get_text": 1200,
+    "browser_get_markdown": 2000,
+    "browser_get_html": 2000,
+    "browser_evaluate": 1000,
+    "browser_get_clickable_elements": 1000,
+    "browser_read_links": 800,
+    "code_python": 2000,
+    "code_javascript": 2000,
+    "sandbox_info": 1500,
+    "file_search": 1500,
+    "file_list": 1500,
+}
+DEFAULT_TRUNCATION = 300
+
+# ------------------------------------------------------------------
+# System prompt
+# ------------------------------------------------------------------
+
+SYSTEM_PROMPT = """你是 AI Chat Sandbox 助手。你可以进行普通对话，也可以在需要时调用工具操作沙箱环境（浏览器、Shell、文件、代码执行）。
 
 ## 工具使用规则
 
-当你需要使用工具时，请遵循以下规则：
+1. **按需调用** — 只在需要沙箱能力时调用工具。常识问答、简单计算直接回复文字。
+2. **逐步执行** — 一次调用必要的工具，观察结果后决定下一步。
+3. **先观察后操作** — 操作浏览器前先用 browser_get_text 或 browser_get_clickable_elements 了解页面状态。
+4. **及时停止** — 以下情况立即停止调用工具并以文字回复：
+   - 任务目标已完成
+   - 同一工具连续 2 次返回同样的错误
+   - 已获取足够信息回答用户
+5. **避免死循环** — 如果发现自己在重复相同的工具调用模式，立即停止用文字说明。
 
-1. **逐步执行**：一次只调用必要的工具，根据上一步结果决定下一步
-2. **先获取信息**：操作浏览器前，先使用 browser_get_clickable_elements 或 browser_get_text 了解页面状态
-3. **及时停止**：以下情况必须停止调用工具，直接回复用户：
-   - 用户的问题已经得到完整回答
-   - 同一工具连续 2 次返回错误或相同结果
-   - 已经获取了足够的信息来回答用户问题
-   - 已经完成了用户要求的操作（如截图、导航、填表等）
-4. **截图展示**：当用户要求查看页面时，使用 browser_screenshot 截图
-5. **避免循环**：如果你发现自己在重复同样的操作，立即停止并用文字说明当前情况
-6. **直接回答**：对于不需要浏览器的常识性问题，直接回复文本，不要调用工具
+## 复杂任务规划
 
-## 图片显示
+- **判断复杂度**：如果用户请求需要 3 次以上的工具调用才能完成，请在调用任何工具之前先用文字输出一份简要计划。
+- **计划格式**：列出关键步骤即可，不必过于详细。
+- **简单任务**：直接执行，不需要规划。
+- **执行中调整**：每步完成后检查是否达到目标，必要时调整后续计划。
+- **失败处理**：某个工具连续报错 2 次后放弃该方案，换一种方式或向用户说明。
 
-当截图工具返回 [IMAGE] 前缀的数据时，请在你的回复中保留 [IMAGE]data:image/png;base64,... 标记来展示图片。
+## 上下文管理
 
-当前可用的沙箱工具可以帮你操作浏览器、执行命令、读写文件、运行代码等。"""
+- 长对话中较早的轮次可能会被系统压缩以节省空间，压缩处会标注「上下文压缩」标记。
+- 看到压缩标记不必在意，继续当前任务即可。
+- 工具结果被截断时会标注省略的字符数。
 
+## 图片展示
+
+截图工具在结果中返回 [IMAGE] 前缀的 base64 数据。请在回复中保留 [IMAGE]data:image/png;base64,... 标记，前端会自动展示。"""
+
+
+# ------------------------------------------------------------------
+# LLM factory
+# ------------------------------------------------------------------
 
 def create_llm() -> BaseLLM:
     if config.llm_provider == "openai":
@@ -65,7 +116,7 @@ def create_tool_registry() -> ToolRegistry:
 
 
 # ------------------------------------------------------------------
-# global cancel registry  (per-session cancel events)
+# Cancel registry (per-session)
 # ------------------------------------------------------------------
 
 _cancel_events: dict[str, asyncio.Event] = {}
@@ -90,9 +141,125 @@ def cleanup_cancel_event(session_id: str) -> None:
 
 
 # ------------------------------------------------------------------
-# agent loop
+# Token estimation (approximate, for context management)
 # ------------------------------------------------------------------
 
+def _estimate_tokens(obj: Any) -> int:
+    """Rough token estimation — 1 token ≈ 3 characters for mixed CJK/ASCII."""
+    if isinstance(obj, str):
+        return max(1, len(obj) // 3)
+    if isinstance(obj, dict):
+        return _estimate_tokens(str(obj))
+    if isinstance(obj, list):
+        return sum(_estimate_tokens(item) for item in obj)
+    return 1
+
+
+# ------------------------------------------------------------------
+# Smart tool-result truncation
+# ------------------------------------------------------------------
+
+def _truncate_result(tool_name: str, result: str) -> str:
+    """Truncate tool result according to tool-specific limits."""
+    limit = TOOL_TRUNCATION_LIMITS.get(tool_name, DEFAULT_TRUNCATION)
+    if len(result) <= limit:
+        return result
+    truncated = result[:limit]
+    omitted = len(result) - limit
+    return f"{truncated}\n\n[...结果已截断，共 {len(result)} 字符，显示前 {limit} 字符，省略 {omitted} 字符]"
+
+
+# ------------------------------------------------------------------
+# Context compression
+# ------------------------------------------------------------------
+
+def _trim_context_if_needed(messages: list[dict], provider: str, emergency: bool = False) -> bool:
+    """Compress messages when estimated tokens exceed threshold. Returns True if trimmed.
+
+    Normal mode: trims when token count > TRIM_THRESHOLD of context window.
+    Emergency mode (called before LLM call): trims more aggressively when
+    token count > EMERGENCY_THRESHOLD, guaranteed to reduce size.
+    """
+    context_window = ESTIMATED_CONTEXT_WINDOW.get(provider, 24_000)
+    threshold = EMERGENCY_THRESHOLD if emergency else TRIM_THRESHOLD
+    max_tokens = int(context_window * threshold)
+
+    total = _estimate_tokens(messages)
+    if not emergency and total <= max_tokens:
+        return False
+
+    # Split system vs non-system
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    non_system = [m for m in messages if m.get("role") != "system"]
+
+    if len(non_system) <= 3:
+        return False
+
+    # Always keep the original user message + last MAX_CONTEXT_PAIRS pairs
+    max_keep = MAX_CONTEXT_PAIRS * 2
+    first_user = non_system[0]
+
+    # Emergency: even cut into the recent window if still over threshold
+    if emergency or len(non_system) > max_keep:
+        # In emergency mode, keep fewer pairs
+        actual_keep = max_keep // 2 if emergency and len(non_system) > max_keep // 2 else max_keep
+        if len(non_system) > actual_keep:
+            last_msgs = non_system[-(actual_keep - 1):]
+            trimmed = len(non_system) - actual_keep
+            # Append compression notice to the original user message instead of
+            # inserting a separate message — consecutive user messages break
+            # the Anthropic API's strict user/assistant alternation requirement.
+            if isinstance(first_user.get("content"), str) and not first_user.get("compressed"):
+                first_user["content"] += f"\n\n[上下文压缩：省略了中间 {trimmed} 条消息以节省空间，关键信息已保留在后续轮次中，继续当前任务即可]"
+                first_user["compressed"] = True
+                compressed = [first_user]
+            else:
+                compressed = [first_user]
+            compressed.extend(last_msgs)
+
+            messages.clear()
+            messages.extend(system_msgs)
+            messages.extend(compressed)
+
+            # If still over threshold in emergency mode, aggressively trim tool results
+            if emergency:
+                for m in messages:
+                    content = m.get("content", "")
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "tool_result":
+                                text = item.get("content", "")
+                                if isinstance(text, str) and len(text) > 500:
+                                    item["content"] = text[:500] + f"[...截断，省略 {len(text) - 500} 字符]"
+
+            return True
+
+    return False
+
+
+# ------------------------------------------------------------------
+# Progress detection for dynamic iteration limits
+# ------------------------------------------------------------------
+
+def _is_still_making_progress(recent_calls: list[tuple[str, str]], window: int = 5) -> bool:
+    """Check whether recent tool calls show meaningful progress.
+
+    Returns False when the same (tool, args) pattern repeats too often,
+    indicating the agent is stuck.
+    """
+    if len(recent_calls) < window:
+        return True  # not enough data yet
+    windowed = recent_calls[-window:]
+    # If the same exact signature appears 3+ times in the window, we're stuck
+    latest = windowed[-1]
+    if windowed.count(latest) >= 3:
+        return False
+    return True
+
+
+# ------------------------------------------------------------------
+# Agent loop
+# ------------------------------------------------------------------
 
 async def agent_loop(
     session: Session,
@@ -106,33 +273,57 @@ async def agent_loop(
     if registry is None:
         registry = create_tool_registry()
 
+    provider = config.llm_provider
     session.add_message("user", user_message)
     llm.inject_system_prompt(session.messages, SYSTEM_PROMPT)
 
     tool_schemas = registry.get_schemas()
 
-    # Track tool calls for loop detection
-    recent_tool_calls: list[tuple[str, str]] = []  # (name, args_str)
+    # Track tool-call signatures for loop and progress detection
+    recent_tool_calls: list[tuple[str, str]] = []
 
-    for iteration in range(MAX_ITERATIONS):
-        # --- check cancellation ---
+    # Track whether we've compressed context already (avoid repeated compression)
+    did_compress = False
+
+    for iteration in range(HARD_LIMIT):
+        # ── cancellation check ──
         if cancel_event and cancel_event.is_set():
             yield {"type": "error", "message": "用户取消了执行"}
             return
 
-        # --- Phase: analyzing ---
+        # ── context compression check (before LLM call) ──
+        if iteration >= 2:
+            # Normal compression — runs every 2 iterations
+            if iteration % 2 == 0:
+                was_trimmed = _trim_context_if_needed(session.messages, provider)
+                if was_trimmed and not did_compress:
+                    did_compress = True
+                    yield {"type": "notice", "message": "上下文已压缩，旧轮次已优化以节省空间"}
+            # Emergency compression — runs EVERY iteration past iteration 4,
+            # ensures we never exceed the hard limit
+            if iteration >= 4:
+                _trim_context_if_needed(session.messages, provider, emergency=True)
+
+        # ── Phase: analyzing ──
+        iteration_label = (
+            f"第 {iteration + 1} 轮：分析需求" if iteration == 0
+            else f"第 {iteration + 1} 轮：分析结果，规划下一步"
+        )
         yield {"type": "phase", "phase": "analyzing", "iteration": iteration + 1,
-               "label": f"第 {iteration + 1} 轮：分析需求" if iteration == 0 else f"第 {iteration + 1} 轮：分析结果，规划下一步"}
-        yield {"type": "thinking_start"}
+               "label": iteration_label}
+
         full_text = ""
         response: LLMResponse | None = None
 
         try:
             stream = llm.chat_stream(session.messages, tool_schemas)
-            async for chunk in stream:
-                # Check cancellation during streaming
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(stream.__anext__(), timeout=120.0)
+                except StopAsyncIteration:
+                    break
+
                 if cancel_event and cancel_event.is_set():
-                    yield {"type": "thinking_end"}
                     yield {"type": "error", "message": "用户取消了执行"}
                     return
 
@@ -144,24 +335,27 @@ async def agent_loop(
                         yield {"type": "text", "content": chunk.content}
                 elif isinstance(chunk, LLMResponse):
                     response = chunk
-        except Exception as e:
+        except asyncio.TimeoutError:
+            logger.warning("LLM call timed out on iteration %d", iteration)
+            yield {"type": "error", "message": "LLM 响应超时，请重试或简化请求"}
+            return
+        except Exception:
             logger.exception("LLM call failed on iteration %d", iteration)
-            yield {"type": "thinking_end"}
-            yield {"type": "error", "message": f"LLM 调用失败：{e}"}
+            yield {"type": "error", "message": "LLM 调用异常，请稍后重试"}
             return
 
-        yield {"type": "thinking_end"}
-
-        # Check cancellation again
         if cancel_event and cancel_event.is_set():
             yield {"type": "error", "message": "用户取消了执行"}
             return
+
+        # Signal end of LLM thinking/reasoning phase
+        yield {"type": "thinking_end"}
 
         if response is None:
             yield {"type": "error", "message": "LLM 未返回有效响应"}
             return
 
-        # --- Phase: responding (final answer) ---
+        # ── Text response → task complete ──
         if response.type == "text":
             yield {"type": "phase", "phase": "responding", "label": "生成回复"}
             text = response.text or ""
@@ -180,44 +374,43 @@ async def agent_loop(
                         if rest:
                             yield {"type": "text", "content": rest}
             elif full_text.strip():
-                if not full_text.strip():
-                    yield {"type": "text", "content": text}
+                yield {"type": "text", "content": text}
 
             session.add_message("assistant", text, reasoning_content=response.reasoning_content)
             return
 
-        # --- Phase: executing (calling tools) ---
+        # ── Tool calls ──
         if response.type == "tool_calls" and response.tool_calls:
             tool_names = [tc.name for tc in response.tool_calls]
             yield {"type": "phase", "phase": "executing", "iteration": iteration + 1,
                    "tools": tool_names, "count": len(tool_names),
                    "label": f"第 {iteration + 1} 轮：调用 {', '.join(tool_names)}"}
 
-            # -------- loop detection --------
-            call_sig = (",".join(tool_names), json.dumps([tc.arguments for tc in response.tool_calls], sort_keys=True))
+            # ── loop detection ──
+            call_sig = (
+                ",".join(tool_names),
+                json.dumps([tc.arguments for tc in response.tool_calls], sort_keys=True),
+            )
             recent_tool_calls.append(call_sig)
-            if len(recent_tool_calls) > 6:
-                recent_tool_calls = recent_tool_calls[-6:]
+            if len(recent_tool_calls) > 8:
+                recent_tool_calls = recent_tool_calls[-8:]
 
-            # Check if the same call pattern repeated 3+ times in the last 4 calls
-            if len(recent_tool_calls) >= 4:
-                last4 = recent_tool_calls[-4:]
-                if last4.count(last4[-1]) >= 3:
-                    yield {"type": "error",
-                           "message": "检测到重复的工具调用模式。Agent 已停止执行以避免死循环。请简化你的请求或换个方式提问。"}
-                    return
-            # --------------------------------------------------
+            # Same pattern 3+ times in last 4 → stuck
+            if not _is_still_making_progress(recent_tool_calls, window=4):
+                yield {"type": "error",
+                       "message": "检测到重复的工具调用模式，Agent 已停止。请简化请求或换个方式提问。"}
+                return
 
+            # ── execute tools ──
             tool_results: list[tuple[Any, str]] = []
             for tc in response.tool_calls:
-                # Check cancellation before each tool
                 if cancel_event and cancel_event.is_set():
                     yield {"type": "error", "message": "用户取消了执行"}
                     return
 
-                # Emit browser action for frontend preview panel
+                # Emit browser action for frontend panel
                 if tc.name.startswith("browser_"):
-                    action = tc.name.replace("browser_", "")
+                    action = tc.name.removeprefix("browser_")
                     evt: dict[str, Any] = {"type": "browser_action", "action": action}
                     if action == "navigate":
                         evt["url"] = tc.arguments.get("url", "")
@@ -238,28 +431,32 @@ async def agent_loop(
                     result = f"工具执行异常：{e}"
                     logger.exception("Tool execution failed: %s", tc.name)
 
-                tool_results.append((tc, result))
-
+                # **IMPORTANT**: convert the raw result into an LLM-safe form
+                # before storing.  Full base64 images (500 K+) would blow the
+                # context window immediately.
                 if result.startswith("[IMAGE]"):
                     img_src = result[7:]
                     yield {"type": "image", "src": img_src}
-                    result_summary = "[截图已获取]"
+                    result_for_llm = "[截图已获取]"
                 elif result.startswith("[ERROR]"):
-                    result_summary = result[:200] + ("..." if len(result) > 200 else "")
+                    result_for_llm = result[:500]
                 else:
-                    result_summary = result[:200] + ("..." if len(result) > 200 else "")
+                    result_for_llm = _truncate_result(tc.name, result)
 
-                yield {"type": "tool_end", "tool": tc.name, "result": result_summary}
+                tool_results.append((tc, result_for_llm))
 
-            # Brief observing phase marker
+                yield {"type": "tool_end", "tool": tc.name, "result": result_for_llm,
+                       "truncated": len(result) > TOOL_TRUNCATION_LIMITS.get(tc.name, DEFAULT_TRUNCATION)}
+
+            # ── Observing phase ──
             yield {"type": "phase", "phase": "observing", "iteration": iteration + 1,
-                   "label": f"第 {iteration + 1} 轮：分析工具执行结果"}
+                   "label": f"第 {iteration + 1} 轮：分析执行结果"}
 
-            # Check cancellation before feeding results back
             if cancel_event and cancel_event.is_set():
                 yield {"type": "error", "message": "用户取消了执行"}
                 return
 
+            # Append messages for next LLM turn
             session.messages.append(
                 llm.format_assistant_tool_calls(tool_results, reasoning_content=response.reasoning_content)
             )
@@ -268,4 +465,12 @@ async def agent_loop(
                     llm.format_tool_result(tc.id, tc.name, result)
                 )
 
-    yield {"type": "error", "message": f"Agent 执行超过 {MAX_ITERATIONS} 轮，已中止。请简化你的请求。"}
+            # ── Dynamic early termination after soft limit ──
+            if iteration + 1 >= SOFT_LIMIT:
+                if not _is_still_making_progress(recent_tool_calls):
+                    yield {"type": "error",
+                           "message": f"Agent 执行已进行 {iteration + 1} 轮，但未取得有效进展，已自动停止。"}
+                    return
+
+    # Hard limit reached
+    yield {"type": "error", "message": f"Agent 执行已进行 {HARD_LIMIT} 轮，已达到最大限制。请简化请求或换个方式提问。"}

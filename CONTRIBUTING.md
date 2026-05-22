@@ -41,7 +41,10 @@ fix/issue-description
 
 ## 架构要点
 
-- **Agent Loop** — 10 轮上限 + 重复调用检测自动终止
+- **Agent Loop** — 25 轮弹性上限（soft limit 15 轮 + hard limit 25 轮），重复调用检测自动终止
+- **上下文管理** — 滑动窗口压缩（保留最近 10 组对话对），45% 阈值触发常规压缩，70% 触发紧急压缩
+- **工具结果截断** — 按工具类型智能截断（shell_exec: 2000, file_read: 3000 等），默认 300 字符
+- **Base64 隔离** — 截图等大块 base64 数据不进入 LLM 上下文窗口，替换为占位符
 - **浏览器控制** — MCP browser tools 首选 → REST 降级 → xdotool 兜底
-- **SSE 事件流** — phase / text / image / tool_start / tool_end / error
+- **SSE 事件流** — phase(planning/analyzing/executing/observing/responding) / thinking / thinking_end / text / image / tool_start / tool_end / notice / error / done
 - **取消机制** — 每会话 `asyncio.Event`，前端随时触发

@@ -448,6 +448,12 @@ function addImageBubble(src) {
   inner.appendChild(wrap); scrollBottom();
 }
 
+function addNoticeBubble(msg) {
+  const el = document.createElement('div'); el.className = 'notice-bubble';
+  el.textContent = '📌 ' + msg;
+  inner.appendChild(el); scrollBottom();
+}
+
 let toolCardEl = null;
 function addToolCard(tool, args) {
   hideEmpty();
@@ -535,7 +541,7 @@ async function send() {
 
   let fullText = '', hasError = false;
   timeline = null; timelineSteps = []; currentTimelineStep = null;
-  let thinkingStepIdx = null;
+  let thinkingStepIdx = null, reasoningText = '';
 
   abortController = new AbortController();
 
@@ -577,7 +583,10 @@ async function send() {
           switch (ev.type) {
 
             case 'phase':
-              if (ev.phase === 'analyzing') {
+              if (ev.phase === 'planning') {
+                addTimelineStep('planning', ev.label || '规划任务', '📋');
+                thinkingStepIdx = null;
+              } else if (ev.phase === 'analyzing') {
                 thinkingStepIdx = addTimelineStep('analyzing', ev.label || '分析需求', '💭');
               } else if (ev.phase === 'executing') {
                 addTimelineStep('executing', ev.label || '调用工具', '🔧');
@@ -592,11 +601,24 @@ async function send() {
               break;
 
             case 'thinking':
+              reasoningText += ev.content;
               if (thinkingStepIdx !== null) appendTimelineDetail(thinkingStepIdx, ev.content);
               break;
 
             case 'thinking_end':
               if (thinkingStepIdx !== null) { completeTimelineStepDOM(thinkingStepIdx); }
+              if (reasoningText) {
+                const rBlock = document.createElement('details');
+                rBlock.className = 'reasoning-block';
+                rBlock.innerHTML = '<summary>🧠 思考过程</summary><div class="reasoning-content">'
+                  + esc(reasoningText) + '</div>';
+                if (bubble.firstChild) {
+                  bubble.insertBefore(rBlock, bubble.firstChild);
+                } else {
+                  bubble.appendChild(rBlock);
+                }
+                reasoningText = '';
+              }
               break;
 
             case 'text':
@@ -622,10 +644,12 @@ async function send() {
               completeToolCard(ev.tool, true);
               break;
 
+            case 'notice':
+              addNoticeBubble(ev.message);
+              break;
+
             case 'error':
               hasError = true; fullText = 'ERROR';
-              stopped = ev.message.includes('取消');
-              finishTimeline(stopped);
               bubble.innerHTML = '<div class="msg-error">⚠ ' + ev.message + '</div>';
               break;
 
