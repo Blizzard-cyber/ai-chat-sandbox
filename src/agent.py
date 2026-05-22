@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import os
+import uuid
 from typing import Any, AsyncGenerator
 
 from .config import config
@@ -84,9 +87,7 @@ SYSTEM_PROMPT = """你是 AI Chat Sandbox 助手。你可以进行普通对话�
 - 看到压缩标记不必在意，继续当前任务即可。
 - 工具结果被截断时会标注省略的字符数。
 
-## 图片展示
-
-截图工具在结果中返回 [IMAGE] 前缀的 base64 数据。请在回复中保留 [IMAGE]data:image/png;base64,... 标记，前端会自动展示。"""
+"""
 
 
 # ------------------------------------------------------------------
@@ -284,6 +285,7 @@ async def agent_loop(
 
     # Track whether we've compressed context already (avoid repeated compression)
     did_compress = False
+    turn_usage = {"prompt_tokens": 0, "completion_tokens": 0}
 
     for iteration in range(HARD_LIMIT):
         # ── cancellation check ──
@@ -314,6 +316,8 @@ async def agent_loop(
 
         full_text = ""
         response: LLMResponse | None = None
+
+        turn_usage["prompt_tokens"] += _estimate_tokens(session.messages) + _estimate_tokens(tool_schemas)
 
         try:
             stream = llm.chat_stream(session.messages, tool_schemas)
@@ -359,28 +363,28 @@ async def agent_loop(
         if response.type == "text":
             yield {"type": "phase", "phase": "responding", "label": "生成回复"}
             text = response.text or ""
-            if "[IMAGE]" in text:
-                parts = text.split("[IMAGE]")
-                for i, part in enumerate(parts):
-                    if i == 0:
-                        if part.strip():
-                            yield {"type": "text", "content": part}
-                    else:
-                        img_data = part.split()[0] if part.strip() else ""
-                        img_data = img_data.strip()
-                        if img_data.startswith("data:image/"):
-                            yield {"type": "image", "src": img_data}
-                        rest = part[len(img_data):].strip()
-                        if rest:
-                            yield {"type": "text", "content": rest}
-            elif full_text.strip():
-                yield {"type": "text", "content": text}
+            turn_usage["completion_tokens"] += _estimate_tokens(text) + _estimate_tokens(response.reasoning_content)
 
             session.add_message("assistant", text, reasoning_content=response.reasoning_content)
+            yield {
+                "type": "usage",
+                "prompt_tokens": turn_usage["prompt_tokens"],
+                "completion_tokens": turn_usage["completion_tokens"],
+                "total_tokens": turn_usage["prompt_tokens"] + turn_usage["completion_tokens"],
+            }
             return
 
         # ── Tool calls ──
         if response.type == "tool_calls" and response.tool_calls:
+            turn_usage["completion_tokens"] += _estimate_tokens(response.reasoning_content) + _estimate_tokens([
+                {"name": tc.name, "arguments": tc.arguments} for tc in response.tool_calls
+            ])
+            yield {
+                "type": "usage",
+                "prompt_tokens": turn_usage["prompt_tokens"],
+                "completion_tokens": turn_usage["completion_tokens"],
+                "total_tokens": turn_usage["prompt_tokens"] + turn_usage["completion_tokens"],
+            }
             tool_names = [tc.name for tc in response.tool_calls]
             yield {"type": "phase", "phase": "executing", "iteration": iteration + 1,
                    "tools": tool_names, "count": len(tool_names),
@@ -408,7 +412,7 @@ async def agent_loop(
                     yield {"type": "error", "message": "用户取消了执行"}
                     return
 
-                # Emit browser action for frontend panel
+                # Emit action event for frontend panel
                 if tc.name.startswith("browser_"):
                     action = tc.name.removeprefix("browser_")
                     evt: dict[str, Any] = {"type": "browser_action", "action": action}
@@ -422,6 +426,14 @@ async def agent_loop(
                     elif action == "scroll":
                         evt["direction"] = tc.arguments.get("direction", "")
                     yield evt
+                else:
+                    # Non-browser tools: show in action log
+                    detail = ""
+                    for k, v in tc.arguments.items():
+                        if isinstance(v, str) and len(v) > 60:
+                            v = v[:60] + "…"
+                        detail += f"{k}={v}, "
+                    yield {"type": "browser_action", "action": tc.name, "detail": detail.rstrip(", ")}
 
                 yield {"type": "tool_start", "tool": tc.name, "args": tc.arguments}
 
@@ -435,8 +447,23 @@ async def agent_loop(
                 # before storing.  Full base64 images (500 K+) would blow the
                 # context window immediately.
                 if result.startswith("[IMAGE]"):
-                    img_src = result[7:]
-                    yield {"type": "image", "src": img_src}
+                    # Save screenshot to file and yield URL instead of base64
+                    img_data = result[7:]  # data:image/png;base64,...
+                    try:
+                        # Parse base64 from data URI
+                        b64_str = img_data
+                        if "," in b64_str:
+                            b64_str = b64_str.split(",", 1)[1]
+                        png_bytes = base64.b64decode(b64_str)
+                        filename = f"{session.session_id}_{uuid.uuid4().hex[:8]}.png"
+                        filepath = os.path.join("static", "screenshots", filename)
+                        with open(filepath, "wb") as f:
+                            f.write(png_bytes)
+                        img_url = f"/static/screenshots/{filename}"
+                    except Exception:
+                        logger.exception("Failed to save screenshot")
+                        img_url = img_data  # fallback to base64
+                    yield {"type": "image", "src": img_url}
                     result_for_llm = "[截图已获取]"
                 elif result.startswith("[ERROR]"):
                     result_for_llm = result[:500]

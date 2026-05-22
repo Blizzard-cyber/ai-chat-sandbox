@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +23,28 @@ app = FastAPI(title="AI Chat Sandbox")
 
 # Serve static assets (js, css, images) under /static
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.on_event("startup")
+async def cleanup_screenshots():
+    """Remove leftover screenshots from previous runs."""
+    _remove_session_screenshots(None)
+
+
+def _remove_session_screenshots(session_id: str | None) -> None:
+    """Remove screenshots for a given session, or ALL screenshots if None."""
+    ss_dir = os.path.join("static", "screenshots")
+    if not os.path.isdir(ss_dir):
+        return
+    for fname in os.listdir(ss_dir):
+        if not fname.endswith(".png"):
+            continue
+        if session_id is not None and not fname.startswith(session_id + "_"):
+            continue
+        try:
+            os.remove(os.path.join(ss_dir, fname))
+        except OSError:
+            pass
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -75,6 +99,19 @@ async def cancel(session_id: str = Query(default="")):
         return {"status": "cancelled", "session_id": session_id}
     else:
         return {"status": "no_active_execution", "session_id": session_id}
+
+
+@app.delete("/api/session")
+async def delete_session(session_id: str = Query(default="")):
+    """Delete a session and its associated screenshot files."""
+    if not session_id:
+        raise HTTPException(status_code=400, detail="缺少 session_id 参数")
+
+    session_manager.delete(session_id)
+    cleanup_cancel_event(session_id)
+    _remove_session_screenshots(session_id)
+
+    return {"status": "deleted", "session_id": session_id}
 
 
 @app.get("/api/config")

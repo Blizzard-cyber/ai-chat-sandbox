@@ -11,11 +11,7 @@ const vncStatusText = document.getElementById('vncStatusText');
 const panelSizeHint = document.getElementById('panelSizeHint');
 
 // cached common nodes
-const sbMsgCount = document.getElementById('sbMsgCount');
-const sbToolCount = document.getElementById('sbToolCount');
 const sbSessionId = document.getElementById('sbSessionId');
-const sbProvider = document.getElementById('sbProvider');
-const sbModel = document.getElementById('sbModel');
 const topbarModel = document.getElementById('topbarModel');
 const topbarTitle = document.getElementById('topbarTitle');
 const inputFooter = document.getElementById('inputFooter');
@@ -38,7 +34,7 @@ const lbImg = document.getElementById('lbImg');
 
 let sessionId = new URLSearchParams(location.search).get('session_id') || '';
 let msgCount = 0, toolCount = 0, allScreenshots = [];
-let timeline = null, timelineSteps = [], currentTimelineStep = null;
+let currentFlowCard = null, currentIteration = 0, currentPhaseStep = null, reasoningText = '';
 let abortController = null;  // For cancellation
 let panelHintTimer = null;
 let vncBaseSize = { w: 1280, h: 720 };
@@ -62,8 +58,6 @@ const esc = s => { const d = document.createElement('div'); d.textContent = s; r
 const scrollBottom = () => { msgsEl.scrollTop = msgsEl.scrollHeight; };
 const hideEmpty = () => { if (emptyState) emptyState.style.display = 'none'; };
 const updateStats = () => {
-  if (sbMsgCount) sbMsgCount.textContent = msgCount;
-  if (sbToolCount) sbToolCount.textContent = toolCount;
   if (sessionId && sbSessionId) sbSessionId.textContent = sessionId;
 };
 const showPanelSizeHint = (value, autoHide = true) => {
@@ -131,9 +125,8 @@ function setPanelMax(isMax) {
   try {
     const r = await fetch('/api/config'); if (!r.ok) return;
     const c = await r.json();
-    if (sbProvider) sbProvider.textContent = c.provider === 'openai' ? 'OpenAI 兼容' : c.provider;
-    const ms = sbModel ? sbModel.querySelector('span:last-child') : null;
-    if (ms) ms.textContent = c.model;
+    const sbf = document.getElementById('sbFooterModel');
+    if (sbf) sbf.textContent = (c.provider === 'openai' ? 'OpenAI 兼容' : c.provider) + ' · ' + c.model;
     if (topbarModel) topbarModel.textContent = c.model;
     if (sbSessionId) sbSessionId.textContent = sessionId || '(新会话)';
     if (inputFooter) {
@@ -146,10 +139,10 @@ function setPanelMax(isMax) {
       const base = c.sandbox_url.replace(/\/$/, '');
       const vncUrl = base + '/vnc/index.html?autoconnect=true';
       if (rpVnc) {
-        setVncStatus('正在连接沙箱浏览器...', true);
+                setVncStatus('正在连接沙箱桌面...', true);
         rpVnc.src = vncUrl;
         rpVnc.addEventListener('load', () => {
-          setTimeout(() => setVncStatus('已加载沙箱浏览器', false), 600);
+          setTimeout(() => setVncStatus('已加载沙箱桌面', false), 600);
           fitVncFrame();
         }, { once: true });
       }
@@ -209,7 +202,7 @@ function updatePanelWidth() {
 }
 function refreshVnc() {
   if (!rpVnc) return;
-  setVncStatus('正在刷新沙箱浏览器...', true);
+  setVncStatus('正在刷新沙箱桌面...', true);
   // reload iframe
   rpVnc.src = rpVnc.src;
   scheduleFitVncFrame();
@@ -314,138 +307,223 @@ function downloadImage(src) {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
 }
 
-// === Agent Timeline ===
-function ensureTimeline() {
-  if (timeline) return;
+// === Flow Card Functions ===
+function createFlowCard(iteration) {
   hideEmpty();
-  timeline = document.createElement('div'); timeline.className = 'timeline';
-  timeline.innerHTML = `
-    <div class="timeline-header" onclick="this.parentElement.classList.toggle('collapsed')">
-      <span class="t-indicator"></span>
-      <span class="t-header-text">Agent 工作流</span>
-      <span class="chevron">▼</span>
+  const card = document.createElement('div');
+  card.className = 'flow-card';
+  card.dataset.round = iteration;
+  card.innerHTML = `
+    <div class="fc-header" onclick="toggleCard(this.parentElement)">
+      <span class="fc-title"><span class="fc-round-num">${iteration}</span> 第 ${iteration} 轮 <span class="fc-chevron">▼</span></span>
+      <span class="fc-status active">进行中</span>
     </div>
-    <div class="timeline-body" id="timelineBody"></div>`;
-  inner.appendChild(timeline);
-  timelineSteps = []; currentTimelineStep = null;
-}
-
-function addTimelineStep(phase, label, icon) {
-  ensureTimeline();
-  if (currentTimelineStep !== null && timelineSteps[currentTimelineStep]) {
-    completeTimelineStepDOM(currentTimelineStep);
-  }
-  const body = document.getElementById('timelineBody');
-  const idx = timelineSteps.length;
-  const step = { phase, label, icon, status: 'active', detail: '', el: null, start: Date.now() };
-  timelineSteps.push(step);
-  currentTimelineStep = idx;
-
-  const cls = { analyzing: 'a', executing: 'e', observing: 'o', responding: 'r' }[phase] || 'a';
-  const div = document.createElement('div'); div.className = 't-step';
-  div.innerHTML = `
-    <div class="t-step-ind">
-      <div class="t-step-icon ${cls}">${icon}</div>
-      <div class="t-step-line"></div>
-    </div>
-    <div class="t-step-body">
-      <div class="t-step-label">${label}</div>
-      <div class="t-step-detail" id="tsd-${idx}"></div>
-      <div class="t-step-time"></div>
-    </div>
-    <div class="t-step-status active">进行中</div>`;
-  body.appendChild(div);
-  step.el = div;
+    <div class="fc-steps"></div>
+    <div class="fc-results"></div>`;
+  inner.appendChild(card);
+  currentFlowCard = card;
+  currentPhaseStep = null;
   scrollBottom();
-  return idx;
 }
 
-function appendTimelineDetail(idx, text) {
-  if (idx === null || idx >= timelineSteps.length) return;
-  const step = timelineSteps[idx];
-  step.detail += text;
-  const el = document.getElementById('tsd-' + idx);
-  if (el) {
-    let display = step.detail;
-    if (display.length > 400) display = display.slice(-400);
-    el.textContent = display;
-    el.scrollTop = el.scrollHeight;
-  }
+function toggleCard(card) {
+  card.classList.toggle('collapsed');
 }
 
-function completeTimelineStepDOM(idx) {
-  if (idx === null || idx >= timelineSteps.length) return;
-  const step = timelineSteps[idx];
-  if (step.status === 'done') return;
-  step.status = 'done';
-  const elapsed = ((Date.now() - step.start) / 1000).toFixed(1);
-  if (step.el) {
-    const s = step.el.querySelector('.t-step-status');
-    if (s) { s.textContent = '✓ ' + elapsed + 's'; s.className = 't-step-status done'; }
-    const t = step.el.querySelector('.t-step-time');
-    if (t) t.textContent = elapsed + 's';
-  }
-}
-
-function finishTimeline(stopped) {
-  if (currentTimelineStep !== null && timelineSteps[currentTimelineStep]) {
-    completeTimelineStepDOM(currentTimelineStep);
-    currentTimelineStep = null;
-  }
-  timelineSteps.forEach((step, i) => {
-    if (step.status !== 'done') completeTimelineStepDOM(i);
-  });
-  if (timeline) {
-    const dot = timeline.querySelector('.t-indicator');
-    if (stopped) {
-      dot.classList.add('stopped');
-      const hdr = timeline.querySelector('.t-header-text');
-      if (hdr) hdr.textContent = 'Agent 工作流 · 已停止';
-    } else {
-      dot.classList.add('done');
-      const hdr = timeline.querySelector('.t-header-text');
-      if (hdr) hdr.textContent = 'Agent 工作流 · 已完成';
+function addFlowStep(phase, label) {
+  if (!currentFlowCard) return null;
+  // Auto-complete previous step
+  if (currentPhaseStep) {
+    const st = currentPhaseStep.querySelector('.fc-step-status');
+    const dot = currentPhaseStep.querySelector('.fc-step-dot');
+    if (st && st.classList.contains('active')) {
+      st.textContent = '✓'; st.className = 'fc-step-status done';
     }
-    setTimeout(() => { if (timeline) timeline.classList.add('collapsed'); }, 4000);
+    if (dot) dot.classList.add('done');
   }
+  const stepsEl = currentFlowCard.querySelector('.fc-steps');
+  const step = document.createElement('div');
+  step.className = 'fc-step';
+  step.dataset.phase = phase;
+  step.innerHTML = `
+    <div class="fc-step-ind">
+      <div class="fc-step-dot ${phase}"></div>
+      <div class="fc-step-line"></div>
+    </div>
+    <div class="fc-step-body">
+      <div class="fc-step-label ${phase}">${label}</div>
+      <div class="fc-step-detail"></div>
+    </div>
+    <div class="fc-step-status active">⏳</div>`;
+  stepsEl.appendChild(step);
+  currentPhaseStep = step;
+  scrollBottom();
+  return step;
+}
+
+function setStepDetail(phase, text) {
+  if (!currentFlowCard) return;
+  const step = currentFlowCard.querySelector(`.fc-step[data-phase="${phase}"]`);
+  if (!step) return;
+  const detail = step.querySelector('.fc-step-detail');
+  if (detail) detail.textContent = text;
+}
+
+function completeAllSteps() {
+  if (!currentFlowCard) return;
+  currentFlowCard.querySelectorAll('.fc-step-status.active').forEach(s => {
+    s.textContent = '✓'; s.className = 'fc-step-status done';
+  });
+  currentFlowCard.querySelectorAll('.fc-step-dot:not(.done)').forEach(d => d.classList.add('done'));
+  currentPhaseStep = null;
+}
+
+function addResultToCard(type, data) {
+  if (!currentFlowCard) return;
+  const results = currentFlowCard.querySelector('.fc-results');
+  const card = document.createElement('div');
+  card.className = 'rc-card success';
+  if (type === 'image') {
+    addScreenshotThumb(data.src);
+    card.innerHTML = `
+      <div class="rc-header"><span class="rc-left">📸 截图结果</span><span class="rc-right"></span></div>
+      <div class="rc-body"><img src="${data.src}" alt="截图" onerror="this.style.display='none'" onclick="openLightbox(this.src)"></div>`;
+  } else if (type === 'error') {
+    card.className = 'rc-card fail';
+    card.innerHTML = `
+      <div class="rc-header"><span class="rc-left">⚠ 执行出错</span><span class="rc-right"></span></div>
+      <div class="rc-body"><div class="rc-log" style="color:var(--error)">${esc(data)}</div></div>`;
+  } else if (type === 'log') {
+    card.innerHTML = `
+      <div class="rc-header"><span class="rc-left">📋 执行输出</span><span class="rc-right"></span></div>
+      <div class="rc-body"><div class="rc-log">${esc(data)}</div></div>`;
+  }
+  results.appendChild(card);
+  scrollBottom();
+}
+
+function setFlowText(text) {
+  if (!currentFlowCard) return;
+  let el = currentFlowCard.querySelector('.fc-text');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'fc-text';
+    currentFlowCard.appendChild(el);
+  }
+  el.innerHTML = renderText(text);
+  scrollBottom();
+}
+
+function navigateToRound(iteration) {
+  const card = document.querySelector(`.flow-card[data-round="${iteration}"]`);
+  if (!card) return;
+  card.classList.remove('collapsed');
+  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  if (window.innerWidth <= 900) closeSidebar();
+}
+
+function addSidebarRound(userMsg, iteration, status) {
+  const list = document.getElementById('roundList');
+  const empty = document.getElementById('roundEmpty');
+  if (empty) empty.style.display = 'none';
+  // Update existing or create new
+  let item = list.querySelector(`.round-nav-item[data-round="${iteration}"]`);
+  if (!item) {
+    item = document.createElement('div');
+    item.className = 'round-nav-item';
+    item.dataset.round = iteration;
+    item.addEventListener('click', () => navigateToRound(iteration));
+    list.appendChild(item);
+  }
+  const badgeCls = status === 'done' ? 'done' : (status === 'fail' ? 'fail' : 'running');
+  const badgeTxt = status === 'done' ? '✓' : (status === 'fail' ? '✗' : '○');
+  const shortMsg = userMsg.length > 36 ? userMsg.slice(0, 36) + '…' : userMsg;
+  item.innerHTML = `
+    <div class="rni-top">
+      <span class="rni-badge ${badgeCls}">${badgeTxt}</span>
+      <span class="rni-text">${esc(shortMsg)}</span>
+    </div>
+    <div class="rni-meta">
+      <span>第 ${iteration} 轮</span>
+      <span>${status === 'done' ? '已完成' : status === 'fail' ? '已失败' : '进行中'}</span>
+    </div>`;
+}
+
+function showFinalResult(text, screenshots, usage, elapsed) {
+  if (!text && screenshots.length === 0) return;
+  const div = document.createElement('div');
+  div.className = 'final-result';
+
+  const total = usage ? (usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0)) : 0;
+  const tokenStr = total >= 1000 ? (total / 1000).toFixed(1) + 'k' : String(total);
+
+  let html = '<div class="fr-header">' +
+    '<span class="fr-status">✓ 任务完成</span>' +
+    '<span class="fr-summary"><span>' + elapsed + 's</span><span>' + screenshots.length + ' 张截图</span><span>~' + tokenStr + ' tokens</span></span>' +
+    '</div><div class="fr-body">';
+
+  // Text first
+  if (text) {
+    html += '<div class="fr-text">' + renderText(text) + '</div>';
+  }
+
+  // Screenshots below text, shown as clickable thumbnails
+  if (screenshots.length > 0) {
+    const unique = screenshots.filter((s, i) => screenshots.indexOf(s) === i);
+    html += '<div class="fr-gallery">' +
+      '<div class="fr-gallery-label">📸 截图 ' + unique.length + ' 张</div>' +
+      '<div class="fr-gallery-grid" id="frGallery' + Date.now() + '"></div></div>';
+  }
+
+  html += '</div>';
+  div.innerHTML = html;
+
+  // Attach gallery click handlers (safe, no inline on* attributes)
+  if (screenshots.length > 0) {
+    const grid = div.querySelector('.fr-gallery-grid');
+    if (grid) {
+      const unique = screenshots.filter((s, i) => screenshots.indexOf(s) === i);
+      unique.forEach((src) => {
+        const item = document.createElement('div');
+        item.className = 'fr-gallery-item';
+        item.addEventListener('click', () => openLightbox(src));
+        const img = document.createElement('img');
+        img.src = src;
+        img.alt = '截图';
+        img.onerror = () => { item.style.display = 'none'; };
+        const num = document.createElement('span');
+        num.className = 'fr-gallery-num';
+        item.appendChild(img);
+        item.appendChild(num);
+        grid.appendChild(item);
+      });
+    }
+  }
+
+  inner.appendChild(div);
+  scrollBottom();
 }
 
 // === Messages ===
 function addUserBubble(text) {
   hideEmpty(); msgCount++; updateStats();
   const row = document.createElement('div'); row.className = 'msg-row user';
-  row.innerHTML = '<div class="msg-meta">你 · ' + ts() + '</div><div class="msg-content"></div>';
+  row.innerHTML = `
+    <div class="msg-shell">
+      <div class="msg-avatar user">我</div>
+      <div class="msg-card">
+        <div class="msg-head">
+          <span class="msg-title">你</span>
+          <span class="msg-time">${ts()}</span>
+        </div>
+        <div class="msg-content"></div>
+        <div class="msg-footer"><span class="token-pill subtle">已发送</span></div>
+      </div>
+    </div>`;
   row.querySelector('.msg-content').textContent = text;
   inner.appendChild(row); scrollBottom();
   if (msgCount === 1 && topbarTitle) topbarTitle.textContent =
     text.length > 30 ? text.slice(0, 30) + '...' : text;
-}
-
-function addAssistantBubble() {
-  hideEmpty(); msgCount++; updateStats();
-  const row = document.createElement('div'); row.className = 'msg-row assistant';
-  row.innerHTML = '<div class="msg-meta">AI · ' + ts() + '</div><div class="msg-content"></div>';
-  inner.appendChild(row);
-  return row.querySelector('.msg-content');
-}
-
-function addImageBubble(src) {
-  hideEmpty(); addScreenshotThumb(src);
-
-  // Container constrained to text width
-  const wrap = document.createElement('div'); wrap.className = 'img-bubble';
-
-  const img = document.createElement('img'); img.src = src; img.loading = 'lazy';
-  img.alt = '截图'; img.title = '点击放大查看';
-  img.onclick = () => openLightbox(src);
-
-  // Caption bar with hint + download button
-  const cap = document.createElement('div'); cap.className = 'img-caption';
-  cap.innerHTML = '<span class="img-hint">点击图片放大查看</span>'
-    + '<button onclick="event.stopPropagation();downloadImage(\'' + src + '\')">下载</button>';
-
-  wrap.appendChild(img); wrap.appendChild(cap);
-  inner.appendChild(wrap); scrollBottom();
 }
 
 function addNoticeBubble(msg) {
@@ -454,33 +532,10 @@ function addNoticeBubble(msg) {
   inner.appendChild(el); scrollBottom();
 }
 
-let toolCardEl = null;
-function addToolCard(tool, args) {
-  hideEmpty();
-  const card = document.createElement('div'); card.className = 'tool-card'; card.id = 'tc-' + tool;
-  const aStr = args ? JSON.stringify(args).replace(/[{}"]/g, '').replace(/,/g, ', ').substring(0, 80) : '';
-  card.innerHTML = `
-    <span class="tc-icon">🔧</span>
-    <div class="tc-info">
-      <div class="tc-name">${tool}</div>
-      ${aStr ? '<div class="tc-args">' + esc(aStr) + '</div>' : ''}
-    </div>
-    <span class="tc-status running">执行中</span>`;
-  inner.appendChild(card); toolCardEl = card; scrollBottom();
-}
-function completeToolCard(tool, ok) {
-  const card = document.getElementById('tc-' + tool);
-  if (!card) return;
-  const s = card.querySelector('.tc-status');
-  if (s) { s.textContent = ok ? '✓' : '✗'; s.className = 'tc-status ' + (ok ? 'ok' : 'err'); }
-  if (ok) card.classList.add('done-card');
-  toolCount++; updateStats();
-  setTimeout(() => { if (card.parentNode) card.remove(); }, 5000);
-}
-
 // === Markdown ===
 function renderText(text) {
-  let html = text
+  // Escape HTML first, then apply markdown
+  let html = esc(text)
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.+?)\*/g, '<em>$1</em>')
     .replace(/`([^`]+)`/g, '<code>$1</code>')
@@ -502,16 +557,28 @@ async function stopExecution() {
 }
 
 // === Clear ===
-function clearChat() {
-  inner.querySelectorAll('.msg-row,.tool-card,.timeline,.img-bubble').forEach(e => e.remove());
+async function clearChat() {
+  // Delete server-side session + screenshots
+  if (sessionId) {
+    try {
+      await fetch('/api/session?session_id=' + encodeURIComponent(sessionId), { method: 'DELETE' });
+    } catch (e) { /* ignore */ }
+  }
+  inner.querySelectorAll('.msg-row,.flow-card,.final-result,.notice-bubble').forEach(e => e.remove());
   if (emptyState) emptyState.style.display = '';
   msgCount = 0; toolCount = 0; allScreenshots = [];
-  timeline = null; timelineSteps = []; currentTimelineStep = null;
+  currentFlowCard = null; currentIteration = 0; currentPhaseStep = null; reasoningText = '';
   if (ssGrid) ssGrid.innerHTML = ''; else document.getElementById('ssGrid').innerHTML = '';
   if (ssEmptyEl) ssEmptyEl.style.display = ''; else document.getElementById('ssEmpty').style.display = '';
   if (actionList) actionList.innerHTML = ''; else document.getElementById('actionList').innerHTML = '';
   if (actEmptyEl) actEmptyEl.style.display = ''; else document.getElementById('actEmpty').style.display = '';
-  if (rpUrl) rpUrl.textContent = '等待导航...'; else document.getElementById('rpUrl').textContent = '等待导航...';
+  const rl = document.getElementById('roundList');
+  if (rl) { rl.querySelectorAll('.round-nav-item').forEach(e => e.remove()); }
+  const re = document.getElementById('roundEmpty');
+  if (re) re.style.display = '';
+  const sft = document.getElementById('sbFooterTokens');
+  if (sft) sft.textContent = '0 tokens';
+  if (rpUrl) rpUrl.textContent = '等待操作...'; else document.getElementById('rpUrl').textContent = '等待操作...';
   closeRightPanel(); updateStats(); sessionId = '';
   const u = new URL(location); u.searchParams.delete('session_id');
   history.replaceState(null, '', u);
@@ -536,12 +603,12 @@ async function send() {
   input.value = ''; input.style.height = 'auto';
   setRunning(true);
 
-  const bubble = addAssistantBubble();
-  bubble.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
-
-  let fullText = '', hasError = false;
-  timeline = null; timelineSteps = []; currentTimelineStep = null;
-  let thinkingStepIdx = null, reasoningText = '';
+  // Reset flow card state
+  currentFlowCard = null; currentIteration = 0; currentPhaseStep = null;
+  reasoningText = '';
+  let fullText = '', hasError = false, usageData = null;
+  const startTime = Date.now();
+  const execScreenshots = [];
 
   abortController = new AbortController();
 
@@ -567,7 +634,6 @@ async function send() {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let stopped = false;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -582,66 +648,92 @@ async function send() {
           const ev = JSON.parse(payload);
           switch (ev.type) {
 
-            case 'phase':
-              if (ev.phase === 'planning') {
-                addTimelineStep('planning', ev.label || '规划任务', '📋');
-                thinkingStepIdx = null;
-              } else if (ev.phase === 'analyzing') {
-                thinkingStepIdx = addTimelineStep('analyzing', ev.label || '分析需求', '💭');
-              } else if (ev.phase === 'executing') {
-                addTimelineStep('executing', ev.label || '调用工具', '🔧');
-                thinkingStepIdx = null;
-              } else if (ev.phase === 'observing') {
-                addTimelineStep('observing', ev.label || '分析结果', '👁');
-                thinkingStepIdx = null;
-              } else if (ev.phase === 'responding') {
-                addTimelineStep('responding', '生成回复', '💬');
-                thinkingStepIdx = null;
+            case 'phase': {
+              const phase = ev.phase;
+              const iteration = ev.iteration;
+              // New iteration → new flow card
+              if (iteration && iteration !== currentIteration) {
+                if (currentFlowCard) {
+                  completeAllSteps();
+                  addSidebarRound(text, currentIteration, 'done');
+                }
+                currentIteration = iteration;
+                createFlowCard(iteration);
+              }
+              const labels = { 'analyzing': '分析', 'executing': '执行', 'observing': '观察', 'responding': '回复' };
+              addFlowStep(phase, labels[phase] || phase);
+              if (ev.label) {
+                setStepDetail(phase, ev.label.replace(/第 \d+ 轮[:：]?\s*/, ''));
               }
               break;
+            }
 
             case 'thinking':
               reasoningText += ev.content;
-              if (thinkingStepIdx !== null) appendTimelineDetail(thinkingStepIdx, ev.content);
+              // Show latest reasoning snippet in analyze step detail
+              if (currentFlowCard) {
+                const st = currentFlowCard.querySelector('.fc-step[data-phase="analyze"] .fc-step-detail');
+                if (st) {
+                  let txt = reasoningText;
+                  if (txt.length > 200) txt = '…' + txt.slice(-200);
+                  st.textContent = txt;
+                }
+              }
               break;
 
             case 'thinking_end':
-              if (thinkingStepIdx !== null) { completeTimelineStepDOM(thinkingStepIdx); }
-              if (reasoningText) {
+              if (reasoningText && currentFlowCard) {
                 const rBlock = document.createElement('details');
-                rBlock.className = 'reasoning-block';
-                rBlock.innerHTML = '<summary>🧠 思考过程</summary><div class="reasoning-content">'
-                  + esc(reasoningText) + '</div>';
-                if (bubble.firstChild) {
-                  bubble.insertBefore(rBlock, bubble.firstChild);
-                } else {
-                  bubble.appendChild(rBlock);
-                }
+                rBlock.className = 'fc-reasoning';
+                rBlock.innerHTML = '<summary>🧠 思考过程</summary><div class="fc-reasoning-content">' + esc(reasoningText) + '</div>';
+                const steps = currentFlowCard.querySelector('.fc-steps');
+                if (steps) steps.after(rBlock);
                 reasoningText = '';
+              }
+              // Complete analyze step
+              if (currentPhaseStep && currentPhaseStep.dataset.phase === 'analyze') {
+                const st = currentPhaseStep.querySelector('.fc-step-status');
+                const dot = currentPhaseStep.querySelector('.fc-step-dot');
+                if (st && st.classList.contains('active')) { st.textContent = '✓'; st.className = 'fc-step-status done'; }
+                if (dot) dot.classList.add('done');
+                currentPhaseStep = null;
               }
               break;
 
             case 'text':
               fullText += ev.content;
-              bubble.innerHTML = renderText(fullText);
-              scrollBottom();
+              setFlowText(fullText);
               break;
 
             case 'image':
-              addImageBubble(ev.src);
+              if (!execScreenshots.includes(ev.src)) {
+                execScreenshots.push(ev.src);
+                addResultToCard('image', { src: ev.src });
+              }
               break;
 
             case 'browser_action':
               openRightPanel();
-              logBrowserAction(ev.action, ev.url || ev.selector || ev.text || ev.direction || '');
+              logBrowserAction(ev.action, ev.detail || ev.url || ev.selector || ev.text || ev.direction || '');
               break;
 
             case 'tool_start':
-              addToolCard(ev.tool, ev.args);
+              setStepDetail('execute', ev.tool + '(' + (ev.args ? JSON.stringify(ev.args).substring(0, 100) : '') + ')');
               break;
 
             case 'tool_end':
-              completeToolCard(ev.tool, true);
+              toolCount++; updateStats();
+              break;
+
+            case 'usage':
+              usageData = ev;
+              {
+                const sft = document.getElementById('sbFooterTokens');
+                if (sft) {
+                  const total = (ev.total_tokens || (ev.prompt_tokens || 0) + (ev.completion_tokens || 0));
+                  sft.textContent = '~' + (total >= 1000 ? (total / 1000).toFixed(1) + 'k' : total) + ' tokens';
+                }
+              }
               break;
 
             case 'notice':
@@ -649,8 +741,12 @@ async function send() {
               break;
 
             case 'error':
-              hasError = true; fullText = 'ERROR';
-              bubble.innerHTML = '<div class="msg-error">⚠ ' + ev.message + '</div>';
+              hasError = true;
+              addResultToCard('error', ev.message);
+              if (currentFlowCard) {
+                const se = currentFlowCard.querySelector('.fc-status');
+                if (se) { se.textContent = '已失败'; se.className = 'fc-status fail'; }
+              }
               break;
 
             case 'done':
@@ -660,20 +756,29 @@ async function send() {
       }
     }
   } catch (err) {
-    if (err.name === 'AbortError') {
-      hasError = true; fullText = 'ERROR';
-      finishTimeline(true);
-      bubble.innerHTML = '<div class="msg-error">⚠ 执行已取消</div>';
-    } else {
-      hasError = true; fullText = 'ERROR';
-      finishTimeline(false);
-      bubble.innerHTML = '<div class="msg-error">⚠ 请求失败: ' + err.message + '</div>';
+    hasError = true;
+    if (!currentFlowCard) createFlowCard(1);
+    const msg = err.name === 'AbortError' ? '执行已取消' : '请求失败: ' + err.message;
+    addResultToCard('error', msg);
+    if (currentFlowCard) {
+      const se = currentFlowCard.querySelector('.fc-status');
+      if (se) { se.textContent = '已失败'; se.className = 'fc-status fail'; }
     }
   } finally {
     setRunning(false);
-    finishTimeline(hasError);
-    if (!fullText.trim()) {
-      bubble.innerHTML = '<div class="msg-error">⚠ 未收到回复，请检查 API 密钥配置（.env 中的 LLM_PROVIDER 和 API_KEY）</div>';
+    if (currentFlowCard) {
+      completeAllSteps();
+      if (!hasError && !fullText.trim() && !currentFlowCard.querySelector('.fc-text')) {
+        addResultToCard('error', '未收到回复，请检查 API 密钥配置（.env 中的 LLM_PROVIDER 和 API_KEY）');
+        hasError = true;
+      }
+      // Collapse all process cards and show final result
+      document.querySelectorAll('.flow-card').forEach(c => c.classList.add('collapsed'));
+      if (!hasError && (fullText.trim() || execScreenshots.length > 0)) {
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        showFinalResult(fullText, execScreenshots, usageData, elapsed);
+      }
+      addSidebarRound(text, currentIteration, hasError ? 'fail' : 'done');
     }
     input.focus();
   }
